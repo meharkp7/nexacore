@@ -52,9 +52,10 @@ except ImportError:  # pragma: no cover
 
 
 def _groq_config() -> tuple[str, str]:
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY", "")
     if not api_key:
-        raise EnvironmentError("GROQ_API_KEY is not set. Check your .env file.")
+        import warnings
+        warnings.warn("GROQ_API_KEY is not set. Agent functionality will be limited.")
     configured = os.getenv("GROQ_MODEL", "").strip()
     model = configured or "openai/gpt-oss-20b"
     if model == "llama3-70b-8192":

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -36,6 +37,7 @@ from config.memory_schema import (
     utc_now_iso,
 )
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_STORE_PATH = hindsight_store_path()
 
@@ -314,7 +316,17 @@ class HindsightClient:
         self.project = os.getenv("HINDSIGHT_PROJECT", "ramp-onboarding-demo")
         self.backend_kind = hindsight_backend()
         if self.backend_kind == "http":
-            self._store: BaseMemoryStore = HindsightHttpMemoryStore()
+            base_url = os.getenv("HINDSIGHT_BASE_URL", "").rstrip("/")
+            api_key = os.getenv("HINDSIGHT_API_KEY", "").strip()
+            if base_url and api_key:
+                self._store: BaseMemoryStore = HindsightHttpMemoryStore()
+            else:
+                logger.warning(
+                    "HINDSIGHT_BACKEND=http but HINDSIGHT_BASE_URL or HINDSIGHT_API_KEY "
+                    "is missing; falling back to local store"
+                )
+                self.backend_kind = "local"
+                self._store = LocalJsonMemoryStore(store_path=store_path)
         else:
             self.backend_kind = "local"
             self._store = LocalJsonMemoryStore(store_path=store_path)

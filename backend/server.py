@@ -95,18 +95,37 @@ limiter = Limiter(key_func=get_remote_address)
 ws_manager = WebSocketManager()
 
 
+def _run_startup_hook(name: str, fn) -> None:
+    """Run optional startup work; never crash the process on seed/agent warmup."""
+    import time
+    start = time.time()
+    logger.info("Starting startup hook: %s", name)
+    try:
+        result = fn()
+        elapsed = round(time.time() - start, 2)
+        if result is not None:
+            logger.info("Startup %s complete in %ss: %s", name, elapsed, result)
+        else:
+            logger.info("Startup %s complete in %ss", name, elapsed)
+    except Exception as e:
+        elapsed = round(time.time() - start, 2)
+        logger.exception("Startup %s failed after %ss (service will continue): %s", name, elapsed, e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Ramp backend starting up...")
     # Migrations run once in gunicorn master (gunicorn.conf.on_starting), not per worker.
     get_db()  # init pool after migrations (never at import time)
     logger.info("Cache backend: %s", cache.backend_name())
-    ensure_demo_data()
-    ensure_employee_data()
-    ingestion = ensure_ingestion_data()
-    logger.info("Ingestion startup complete: %s", ingestion)
-    get_agent()  # warm up singleton, validates GROQ_API_KEY early
-    logger.info("Agent ready")
+    _run_startup_hook("demo seed", ensure_demo_data)
+    _run_startup_hook("employee seed", ensure_employee_data)
+    _run_startup_hook("ingestion", ensure_ingestion_data)
+    # Only warmup agent if GROQ_API_KEY is configured
+    if os.getenv("GROQ_API_KEY"):
+        _run_startup_hook("agent warmup", get_agent)
+    else:
+        logger.warning("Skipping agent warmup: GROQ_API_KEY not configured")
     yield
     logger.info("Ramp backend shutting down")
 
