@@ -11,14 +11,20 @@ import os
 
 def allowed_origins() -> list[str]:
     configured = os.getenv("CORS_ALLOW_ORIGINS", "").strip()
+    origins: list[str] = []
     if configured:
-        return [origin.strip() for origin in configured.split(",") if origin.strip()]
-    return [
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
-    ]
+        origins.extend(origin.strip() for origin in configured.split(",") if origin.strip())
+    else:
+        origins.extend([
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:5173",
+        ])
+    frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
+    if frontend_url and frontend_url not in origins:
+        origins.append(frontend_url)
+    return origins
 
 
 def app_env() -> str:
