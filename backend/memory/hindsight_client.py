@@ -20,6 +20,7 @@ from typing import Any
 from uuid import uuid4
 
 import requests
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from backend.db import AppDatabase
 from backend.interfaces import MemoryItem
@@ -195,7 +196,7 @@ class LocalJsonMemoryStore(BaseMemoryStore):
 
 class HindsightHttpMemoryStore(BaseMemoryStore):
     """
-    Generic HTTP adapter scaffold.
+    Managed Hindsight HTTP adapter with retries and configurable paths.
 
     Expected environment:
     - HINDSIGHT_BASE_URL
@@ -212,14 +213,34 @@ class HindsightHttpMemoryStore(BaseMemoryStore):
         self.search_path = os.getenv("HINDSIGHT_SEARCH_PATH", "/search")
         self.write_path = os.getenv("HINDSIGHT_WRITE_PATH", "/records")
         self.namespaces_path = os.getenv("HINDSIGHT_NAMESPACES_PATH", "/namespaces")
+        self.health_path = os.getenv("HINDSIGHT_HEALTH_PATH", "/health")
         if not self.base_url or not self.api_key:
             raise EnvironmentError(
                 "Hindsight HTTP backend selected but HINDSIGHT_BASE_URL or HINDSIGHT_API_KEY is missing."
             )
 
-    def list_namespaces(self) -> dict[str, dict[str, Any]]:
-        response = requests.get(self.base_url + self.namespaces_path, headers=self._headers(), timeout=30)
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, min=0.5, max=4))
+    def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        response = requests.request(
+            method,
+            self.base_url + path,
+            headers=self._headers(),
+            timeout=kwargs.pop("timeout", 30),
+            **kwargs,
+        )
         response.raise_for_status()
+        return response
+
+    def healthcheck(self) -> dict[str, Any]:
+        try:
+            response = self._request("GET", self.health_path)
+            payload = response.json() if response.content else {"status": "ok"}
+            return {"status": "ok", "backend": "http", "details": payload}
+        except Exception as exc:
+            return {"status": "degraded", "backend": "http", "error": str(exc)}
+
+    def list_namespaces(self) -> dict[str, dict[str, Any]]:
+        response = self._request("GET", self.namespaces_path)
         data = response.json()
         if isinstance(data, dict):
             return data.get("namespaces", data)
@@ -239,22 +260,10 @@ class HindsightHttpMemoryStore(BaseMemoryStore):
             "scope_id": scope_id,
             "tags": normalize_tags(tags or []),
         }
-        response = requests.post(
-            self.base_url + self.namespaces_path,
-            headers=self._headers(),
-            json=payload,
-            timeout=30,
-        )
-        response.raise_for_status()
+        self._request("POST", self.namespaces_path, json=payload)
 
     def write_record(self, record: StoredMemoryRecord) -> StoredMemoryRecord:
-        response = requests.post(
-            self.base_url + self.write_path,
-            headers=self._headers(),
-            json=record.to_dict(),
-            timeout=30,
-        )
-        response.raise_for_status()
+        response = self._request("POST", self.write_path, json=record.to_dict())
         payload = response.json()
         if isinstance(payload, dict) and payload:
             return StoredMemoryRecord(**payload.get("record", payload))
@@ -274,31 +283,22 @@ class HindsightHttpMemoryStore(BaseMemoryStore):
             "limit": limit,
             "namespace": namespace,
         }
-        response = requests.post(
-            self.base_url + self.search_path,
-            headers=self._headers(),
-            json=payload,
-            timeout=30,
-        )
-        response.raise_for_status()
+        response = self._request("POST", self.search_path, json=payload)
         data = response.json()
         records = data.get("records", data if isinstance(data, list) else [])
         return [StoredMemoryRecord(**record) for record in records]
 
     def reset(self) -> None:
         reset_path = os.getenv("HINDSIGHT_RESET_PATH", "/records/reset")
-        response = requests.post(
-            self.base_url + reset_path,
-            headers=self._headers(),
-            timeout=30,
-        )
-        if response.status_code in {200, 204, 404}:
-            return
-        response.raise_for_status()
+        try:
+            self._request("POST", reset_path)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return
+            raise
 
     def count_records(self) -> int:
-        response = requests.get(self.base_url + self.search_path, headers=self._headers(), timeout=30)
-        response.raise_for_status()
+        response = self._request("GET", self.search_path)
         data = response.json()
         return int(data.get("count", 0))
 

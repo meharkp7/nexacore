@@ -30,7 +30,7 @@ from slowapi.errors import RateLimitExceeded
 from backend.logging_middleware import LoggingMiddleware
 from backend.websocket_manager import WebSocketManager, WebSocketMessage
 
-from backend.interfaces import AgentResponse, OnboardingRequest, SessionRequest
+from backend.interfaces import AgentResponse, ConsentRequest, OidcCallbackRequest, OnboardingRequest, SessionRequest
 from backend.agent.agent import get_agent
 from backend.auth import authenticate_request, create_session
 from backend.auth_oidc import OIDCFactory
@@ -42,12 +42,15 @@ from backend.memory.hindsight_client import HindsightClient
 from backend.memory.seed_data import ensure_demo_data
 from backend.memory.seed_employees import ensure_employee_data
 from backend.memory.ensure_ingestion import ensure_ingestion_data
+from backend.analytics import get_analytics_instance
 from backend.analytics_summary import build_analytics_summary
+from backend.cache import cache
 from backend.compliance import ComplianceManager
+from backend.db_migrate import run_migrations
 from backend.interfaces import FeedbackRequest
-from backend.rbac import Permission
+from backend.rbac import Permission, get_rbac
 from backend.rbac_deps import require_permission
-from backend.settings import integrations_mode
+from backend.settings import integrations_mode, ticket_backend
 from backend.observability import metrics
 from backend.settings import allowed_origins, app_env
 from backend.runtime_paths import reminder_store_path, ticket_store_path
@@ -56,6 +59,25 @@ logger = logging.getLogger(__name__)
 REMINDER_LOG = reminder_store_path()
 TICKET_LOG = ticket_store_path()
 DB = AppDatabase.get()
+
+MEMORY_CACHE_TTL = int(os.getenv("MEMORY_CACHE_TTL", "120"))
+SESSION_CACHE_TTL = int(os.getenv("SESSION_CACHE_TTL", "300"))
+
+
+def _invalidate_memory_cache() -> None:
+    cache.invalidate_pattern("memories:*")
+
+
+def _cached_session(session_id: str) -> dict | None:
+    key = f"session:{session_id}"
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    session = DB.get_session(session_id)
+    if session is not None:
+        cache.set(key, session, SESSION_CACHE_TTL)
+    return session
+
 
 # Rate limiting
 limiter = Limiter(key_func=get_remote_address)
@@ -67,6 +89,8 @@ ws_manager = WebSocketManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Ramp backend starting up...")
+    run_migrations()
+    logger.info("Cache backend: %s", cache.backend_name())
     ensure_demo_data()
     ensure_employee_data()
     ingestion = ensure_ingestion_data()
@@ -386,14 +410,14 @@ async def get_session_endpoint(request: Request, session_id: str):
     
     Returns the full session object including user profile, team context, and metadata.
     """
-    session = DB.get_session(session_id)
+    session = _cached_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return session
 
 
-@app.get("/sessions")
-async def list_sessions_endpoint(tags=["sessions"]):
+@app.get("/sessions", tags=["sessions"], dependencies=[Depends(require_permission(Permission.VIEW_AUDIT_LOG))])
+async def list_sessions_endpoint():
     """
     List recent sessions.
     
@@ -417,6 +441,10 @@ async def memories(request: Request, team: str, employee_type: str = "fte", role
     
     Memories are ranked by relevance to the employee's profile.
     """
+    cache_key = f"memories:{team}:{employee_type}:{role}:{demo_mode}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
     try:
         builder = ContextBuilder()
         user = UserProfile(
@@ -430,7 +458,9 @@ async def memories(request: Request, team: str, employee_type: str = "fte", role
             filtered = fetch_person1_demo_memories()
         else:
             filtered = apply_demo_mode(ctx.memories, demo_mode)
-        return {"memories": [_ui_memory_shape(memory) for memory in filtered]}
+        payload = {"memories": [_ui_memory_shape(memory) for memory in filtered]}
+        cache.set(cache_key, payload, MEMORY_CACHE_TTL)
+        return payload
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -450,7 +480,7 @@ async def memory_summary():
     return summary
 
 
-@app.get("/reminders", tags=["data"])
+@app.get("/reminders", tags=["data"], dependencies=[Depends(require_permission(Permission.VIEW_REMINDER))])
 async def reminders():
     """
     List all pending reminders.
@@ -466,7 +496,7 @@ async def reminders():
     return {"reminders": reminders_list}
 
 
-@app.get("/tickets", tags=["data"])
+@app.get("/tickets", tags=["data"], dependencies=[Depends(require_permission(Permission.VIEW_TICKET))])
 async def tickets():
     """
     List all IT tickets created during onboarding.
@@ -482,7 +512,7 @@ async def tickets():
     return {"tickets": tickets_list}
 
 
-@app.get("/audit", tags=["data"])
+@app.get("/audit", tags=["data"], dependencies=[Depends(require_permission(Permission.VIEW_AUDIT_LOG))])
 async def audit():
     """
     Audit event log for compliance and debugging.
@@ -500,7 +530,7 @@ async def audit():
     return {"events": events}
 
 
-@app.post("/demo/reset", tags=["demo"])
+@app.post("/demo/reset", tags=["demo"], dependencies=[Depends(require_permission(Permission.SYSTEM_ADMIN))])
 async def demo_reset():
     """
     Reset demo data to seed state.
@@ -514,6 +544,8 @@ async def demo_reset():
     seed_demo_data(reset=True)
     seed_employees(reset=False)
     ingestion = ensure_ingestion_data()
+    _invalidate_memory_cache()
+    cache.clear()
     DB.insert_audit_event(event_type="demo.reset", payload={"reset": True, "ingestion": ingestion})
     return {
         "status": "reset",
@@ -527,9 +559,16 @@ async def demo_reset():
 async def integrations_status():
     """Return whether Jira/email integrations are in demo or live mode."""
     mode = integrations_mode()
+    backend = ticket_backend()
     return {
         "mode": mode,
+        "ticket_backend": backend,
         "jira_configured": bool(os.getenv("JIRA_API_TOKEN")),
+        "servicenow_configured": bool(
+            os.getenv("SERVICENOW_INSTANCE_URL")
+            and os.getenv("SERVICENOW_USERNAME")
+            and os.getenv("SERVICENOW_PASSWORD")
+        ),
         "email_configured": bool(os.getenv("SMTP_HOST") or os.getenv("SENDGRID_API_KEY")),
         "label": "live integrations" if mode == "live" else "mock integrations (demo)",
     }
@@ -549,10 +588,39 @@ async def compliance_export(user_name: str):
     return export.model_dump()
 
 
+@app.delete("/compliance/users/{user_name}", tags=["data"], dependencies=[Depends(require_permission(Permission.SYSTEM_ADMIN))])
+async def compliance_delete_user(user_name: str):
+    """GDPR right-to-erasure for a user."""
+    manager = ComplianceManager()
+    deleted = manager.delete_user_data(user_name)
+    return {"deleted": deleted, "user_name": user_name}
+
+
+@app.post("/compliance/consent", tags=["data"])
+async def compliance_set_consent(request: Request, payload: ConsentRequest):
+    """Record user consent for analytics/marketing/cookies."""
+    manager = ComplianceManager()
+    record = manager.set_consent(
+        user_id=payload.user_id or request.state.auth.subject,
+        category=payload.category,
+        granted=payload.granted,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+    return record.model_dump()
+
+
+@app.get("/compliance/report", tags=["data"], dependencies=[Depends(require_permission(Permission.VIEW_AUDIT_LOG))])
+async def compliance_report():
+    """Compliance and data-protection summary."""
+    manager = ComplianceManager()
+    return manager.get_compliance_report()
+
+
 @app.get("/sessions/{session_id}/messages", tags=["sessions"])
 async def session_messages(session_id: str):
     """Chat history for a session."""
-    if not DB.get_session(session_id):
+    if not _cached_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
     return {"session_id": session_id, "messages": DB.list_chat_messages(session_id)}
 
@@ -572,6 +640,7 @@ async def submit_feedback(request: Request, payload: FeedbackRequest):
         query_text=payload.query,
     )
     if payload.helpful and payload.team and payload.query:
+        _invalidate_memory_cache()
         HindsightClient().write(
             MemoryItem(
                 content=f"Verified answer for '{payload.query}': {payload.comment or 'marked helpful'}",
@@ -678,7 +747,7 @@ async def oidc_login(redirect_uri: str, state: str = None):
 
 
 @app.post("/auth/oidc/callback", tags=["authentication"])
-async def oidc_callback(code: str, redirect_uri: str, state: str = None):
+async def oidc_callback(payload: OidcCallbackRequest):
     """
     Handle OIDC callback after user authentication.
     
@@ -713,7 +782,7 @@ async def oidc_callback(code: str, redirect_uri: str, state: str = None):
             )
         
         # Exchange code for tokens
-        tokens = await provider.get_token(code=code, redirect_uri=redirect_uri)
+        tokens = await provider.get_token(code=payload.code, redirect_uri=payload.redirect_uri)
         
         # Verify and decode ID token
         id_token = tokens.get("id_token")
@@ -721,25 +790,31 @@ async def oidc_callback(code: str, redirect_uri: str, state: str = None):
             raise HTTPException(status_code=400, detail="No ID token in response")
         
         user_info = await provider.verify_token(id_token)
-        
-        # Create a session for the authenticated user
-        session_id = str(uuid.uuid4())
+        subject = user_info.email or user_info.sub
+        get_rbac().sync_oidc_roles(
+            subject,
+            groups=user_info.groups or [],
+            roles=user_info.roles or [],
+        )
+
         session = create_session(
             user_name=user_info.name or user_info.email or user_info.sub,
-            team_name="default",  # Can be customized based on user_info.groups or roles
+            team_name="default",
             role_title="",
             employment_type="fte",
+            auth_subject=subject,
             metadata={
                 "auth_method": "oidc",
                 "provider": os.getenv("OIDC_PROVIDER"),
                 "email": user_info.email,
                 "sub": user_info.sub,
-            }
+            },
         )
+        session_id = session["session_id"]
         
         DB.insert_audit_event(
             event_type="auth.oidc.login_completed",
-            actor=user_info.email or user_info.sub,
+            actor=subject,
             session_id=session_id,
             payload={
                 "provider": os.getenv("OIDC_PROVIDER"),
@@ -853,6 +928,7 @@ async def chat(request: Request, payload: OnboardingRequest) -> AgentResponse:
     request.state.session_id = payload.session_id
 
     try:
+        cache.delete(f"session:{payload.session_id}")
         DB.upsert_session(
             session_id=payload.session_id,
             user_name=payload.name,
@@ -905,6 +981,7 @@ async def chat(request: Request, payload: OnboardingRequest) -> AgentResponse:
             },
         )
         if response.new_memories_written:
+            _invalidate_memory_cache()
             await ws_manager.broadcast(
                 payload.session_id,
                 WebSocketMessage(
@@ -919,6 +996,15 @@ async def chat(request: Request, payload: OnboardingRequest) -> AgentResponse:
                     session_id=payload.session_id,
                 ),
             )
+        get_analytics_instance().track(
+            user_id=request.state.auth.subject,
+            event="chat.completed",
+            properties={
+                "team": payload.team,
+                "session_id": payload.session_id,
+                "memories_used": len(response.memories_used),
+            },
+        )
         return response
     except ValueError as e:
         logger.warning("Validation error: %s", e)
