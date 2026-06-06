@@ -36,3 +36,16 @@ def integrations_mode() -> str:
 
 def auth_required() -> bool:
     return os.getenv("AUTH_REQUIRED", "false").strip().lower() in {"1", "true", "yes"}
+
+
+def rbac_enforced() -> bool:
+    """Enforce RBAC in production/staging or when AUTH_REQUIRED is enabled."""
+    if os.getenv("RBAC_ENFORCE", "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    if auth_required():
+        return True
+    return app_env() not in {"development", "test"}
+
+
+def ticket_backend() -> str:
+    return os.getenv("TICKET_BACKEND", "jira").strip().lower()
